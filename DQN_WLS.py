@@ -6,125 +6,349 @@ import random
 from collections import deque
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
-from shapely.geometry import Polygon
-from shapely.ops import cascaded_union
-import time
-start_time = time.time()
+from shapely.geometry import Point, Polygon
+from shapely.ops import unary_union, cascaded_union
+
+# ==============================
+# Channel utilities (LoS + UPA)
+# ==============================
+
+def unit_vec(v):
+    n = np.linalg.norm(v) + 1e-12
+    return v / n
+
+def direction_cosines_from_az_el(az, el):
+    # az: radians [0, 2pi), el: radians [-pi/2, pi/2]
+    # returns theta_x, theta_y used by UPA steering vectors
+    # For a far-field plane wave arriving with az/el,
+    # direction cosines can be mapped as (see paper's UPA convention):
+    # theta_x = sin(el) * cos(az), theta_y = sin(el) * sin(az)
+    thx = np.sin(el) * np.cos(az)
+    thy = np.sin(el) * np.sin(az)
+    return thx, thy
+
+def az_el_from_vector(v):
+    # v: 3D vector from satellite to UT
+    vx, vy, vz = v
+    r = np.linalg.norm(v) + 1e-12
+    az = np.arctan2(vy, vx)  # [-pi, pi]
+    el = np.arcsin(vz / r)   # [-pi/2, pi/2]
+    return az, el
+
+def upa_steering_vector(Nx, Ny, theta_x, theta_y):
+    # a_x, a_y as in the paper
+    # element spacing = 0.5 lambda (implicit in pi factors)
+    ax = np.exp(-1j * np.pi * theta_x * np.arange(Nx)) / np.sqrt(Nx)
+    ay = np.exp(-1j * np.pi * theta_y * np.arange(Ny)) / np.sqrt(Ny)
+    a = np.kron(ax, ay)  # Nx * Ny elements
+    return a
+
+# ==============================
+# Environment  (全部以「公尺」為單位)
+# ==============================
 
 class BeamEnv:
-    def __init__(self, N_sats, beam_radius, beam_sep, UT_position):
+    def __init__(self, 
+                 N_sats=10, 
+                 beam_radius=50_000.0,   # 50 km → 50000 m
+                 beam_sep=75_000.0,      # 75 km → 75000 m
+                 UT_position=(0.0, 0.0),
+                 # Channel model params
+                 fc=12e9,           # 12 GHz Ku-band
+                 Gt_dBi=35.0,       # tx gain (dBi)
+                 Gr_dBi=10.0,       # rx gain (dBi)
+                 Nx=8, Ny=8,        # UPA size
+                 noise_figure_dB=5.0,
+                 bandwidth=20e6,    # 20 MHz
+                 temperature=290.0, # K
+                 altitude_m=550_000.0,  # 550 km → 550000 m, satellite altitude
+                 n_interferers=3,   # number of co-channel interferers
+                 snr_db_clip=(-10.0, 30.0) # for normalization
+                ):
         self.N_sats = N_sats
-        self.beam_radius = beam_radius
-        self.beam_sep = beam_sep
-        self.UT_position = np.array(UT_position)
+        self.beam_radius = float(beam_radius)  # m
+        self.beam_sep = float(beam_sep)        # m
+        self.UT_position = np.array(UT_position, dtype=float)  # m
+
+        # Channel params
+        self.c = 299792458.0
+        self.fc = fc
+        self.lam = self.c / self.fc
+        self.Gt = 10**(Gt_dBi/10.0)
+        self.Gr = 10**(Gr_dBi/10.0)
+        self.Nx, self.Ny = Nx, Ny
+        self.noise_figure_dB = noise_figure_dB
+        self.bandwidth = bandwidth
+        self.temperature = temperature
+        self.kB = 1.380649e-23
+        self.altitude = altitude_m  # m
+        self.n_interferers = n_interferers
+        self.snr_db_clip = snr_db_clip
         self.reset()
-        
+
+    # ---------- helpers ----------
+    def _thermal_noise_watts(self):
+        # kTB * NF
+        N0 = self.kB * self.temperature * self.bandwidth
+        NF = 10**(self.noise_figure_dB/10.0)
+        return N0 * NF
+
+    def _free_space_path_loss_linear(self, d_m):
+        # L = (4*pi*f_c*d/c)^2
+        return (4.0*np.pi*self.fc*d_m/self.c)**2
+
+    def _upa_channel_vector(self, s_sat_xyz, ut_xyz):
+        # LoS: g_i = beta_i * e^{j phi_i} * a_t(phi_i)
+        v = ut_xyz - s_sat_xyz  # from sat to UT
+        d = np.linalg.norm(v) + 1e-12  # m
+        az, el = az_el_from_vector(v)
+        thx, thy = direction_cosines_from_az_el(az, el)
+        a = upa_steering_vector(self.Nx, self.Ny, thx, thy)
+        L = self._free_space_path_loss_linear(d)
+        beta = np.sqrt(self.Gt * self.Gr / L)
+        phi = np.random.uniform(0.0, 2*np.pi)
+        g = beta * np.exp(1j*phi) * a
+        return g, d, az, el
+
+    def _random_interferer(self, s_sat_xyz, ut_xyz):
+        # random different az/el vs desired
+        az = np.random.uniform(-np.pi, np.pi)
+        el = np.random.uniform(0.0, np.deg2rad(60.0))
+        thx, thy = direction_cosines_from_az_el(az, el)
+        a = upa_steering_vector(self.Nx, self.Ny, thx, thy)
+        d = np.linalg.norm(ut_xyz - s_sat_xyz) + 1e-12
+        L = self._free_space_path_loss_linear(d)
+        beta = np.sqrt(self.Gt * self.Gr / L)
+        return beta * a
+
+    def _update_dynamic_beam_radius(self):
+        # 以公尺為單位做微調：在 10 km ~ 100 km 之間
+        fluctuation = np.random.normal(loc=0.0, scale=2_000.0)  # ±2 km
+        self.beam_radius = float(np.clip(self.beam_radius + fluctuation,
+                                         10_000.0, 100_000.0))
+
     def reset(self):
+        self._update_dynamic_beam_radius()
         self.detected_beams = self._generate_beam_positions()
         self.undetected_beams = self._generate_beam_positions()
         self.state = self._compute_state()
         return self.state
-    
+
     def _generate_beam_positions(self):
-        center_offset = np.random.uniform(-10, 10, (self.N_sats, 2))
-        start_points = self.UT_position + center_offset + np.random.uniform(-5, 5, (self.N_sats, 2))
-        end_points = start_points + np.random.uniform(-3, 3, (self.N_sats, 2))
-        return np.stack([start_points, end_points], axis=1)
-    
-    def _compute_state(self):
-        state = []
-        for i in range(self.N_sats):
-            beam = self.detected_beams[i]
-            beam_center = (beam[0] + beam[1]) / 2
-            distance_to_ut = np.linalg.norm(beam_center - self.UT_position)
-            normalized_distance = np.clip(1.0 - distance_to_ut / 20.0, 0, 1)
-            state.append(normalized_distance)
-        return np.array(state)
-    
+        """
+        這裡的座標全部以「公尺」為單位：
+        - UT 周圍 ±10 km 的隨機 offset
+        - 再疊加 ±5 km / ±3 km 的微調
+        """
+        center_offset = np.random.uniform(-10_000.0, 10_000.0, (self.N_sats, 2))
+        start_points = (self.UT_position
+                        + center_offset
+                        + np.random.uniform(-5_000.0, 5_000.0, (self.N_sats, 2)))
+        end_points = start_points + np.random.uniform(-3_000.0, 3_000.0, (self.N_sats, 2))
+        return np.stack([start_points, end_points], axis=1)  # (N, 2, 2)
+
     def _compute_beam_center(self, beam):
-        return (beam[0] + beam[1]) / 2
-    
+        return (beam[0] + beam[1]) / 2.0
+
     def _create_circle_polygon(self, center, radius, n_points=32):
         angles = np.linspace(0, 2*np.pi, n_points)
-        circle_points = np.array([(center[0] + radius*np.cos(theta),
-                                 center[1] + radius*np.sin(theta)) for theta in angles])
+        circle_points = np.array([
+            (center[0] + radius*np.cos(theta),
+             center[1] + radius*np.sin(theta))
+            for theta in angles
+        ])
         return Polygon(circle_points)
-    
+
     def _compute_intersection_centroid(self, detected_beams, undetected_beams=None):
-        beam_polygons = [self._create_circle_polygon(self._compute_beam_center(beam), 
-                                                   self.beam_radius/5) for beam in detected_beams]
+        beam_polygons = [
+            self._create_circle_polygon(self._compute_beam_center(beam),
+                                        self.beam_radius/5.0)
+            for beam in detected_beams
+        ]
         intersection = cascaded_union(beam_polygons)
-        
         if undetected_beams is not None:
-            undetected_polygons = [self._create_circle_polygon(self._compute_beam_center(beam), 
-                                                             self.beam_radius/5) for beam in undetected_beams]
+            undetected_polygons = [
+                self._create_circle_polygon(self._compute_beam_center(beam),
+                                            self.beam_radius/5.0)
+                for beam in undetected_beams
+            ]
             for polygon in undetected_polygons:
                 if intersection.intersects(polygon):
                     intersection = intersection.difference(polygon)
-        
         if not intersection.is_empty:
             centroid = intersection.centroid
-            return np.array([centroid.x, centroid.y])
-        return self.UT_position
-    
+            return np.array([centroid.x, centroid.y], dtype=float)
+        return self.UT_position.copy()
+
+    # --------------------
+    # Channel-aware state
+    # --------------------
+    def _beam_channel_features(self, beam_center_xy):
+        """
+        Returns features for one beam using the channel model:
+        distance (norm), azimuth (norm), elevation (norm),
+        SINR (norm), pseudo-range (norm), phase (norm)
+        """
+        # 2D -> 3D lift (m)
+        ut_xyz = np.array([self.UT_position[0], self.UT_position[1], 0.0], dtype=float)
+        sat_xyz = np.array([beam_center_xy[0], beam_center_xy[1], self.altitude], dtype=float)
+
+        # Desired channel
+        g, d_m, az, el = self._upa_channel_vector(sat_xyz, ut_xyz)
+
+        # Beamformer pointing to desired AoD
+        thx, thy = direction_cosines_from_az_el(az, el)
+        f_des = upa_steering_vector(self.Nx, self.Ny, thx, thy)  # tx
+        f_des = f_des / (np.linalg.norm(f_des) + 1e-12)
+
+        # Interferers
+        interf_powers = 0.0
+        for _ in range(self.n_interferers):
+            f_k = self._random_interferer(sat_xyz, ut_xyz)
+            interf_powers += np.abs(np.vdot(g, f_k))**2
+
+        # Signal & noise
+        signal_power = np.abs(np.vdot(g, f_des))**2
+        noise_power = self._thermal_noise_watts()
+
+        sinr_lin = signal_power / (interf_powers + noise_power + 1e-18)
+        sinr_db = 10.0 * np.log10(max(sinr_lin, 1e-18))
+
+        # Normalize features
+        # distance: 使用 km 做 normalization，數值仍然來自 d_m
+        dist_km = d_m / 1000.0
+        norm_distance = np.clip(dist_km / 50.0, 0.0, 1.0)  # 0~50 km scale
+
+        # az ∈ [-pi, pi] → [0,1], el ∈ [-pi/2, pi/2] → [0,1]
+        norm_az = (az + np.pi) / (2.0*np.pi)
+        norm_el = (el + (np.pi/2.0)) / np.pi
+
+        # clip SINR dB to [min,max] then map to [0,1]
+        min_db, max_db = self.snr_db_clip
+        sinr_db_clipped = np.clip(sinr_db, min_db, max_db)
+        norm_sinr = (sinr_db_clipped - min_db) / (max_db - min_db + 1e-12)
+
+        # pseudo-range: distance + Gaussian error with variance derived from SINR
+        sigma_m = 30.0 / np.sqrt(1.0 + sinr_lin)  # meters
+        pseudo_range_m = d_m + np.random.normal(0.0, sigma_m)
+        norm_range = np.clip(pseudo_range_m / self.altitude, 0.0, 1.0)
+
+        # Phase within one wavelength
+        phase = (pseudo_range_m % self.lam) / self.lam  # [0,1)
+
+        return np.array([
+            norm_distance, norm_az, norm_el,
+            norm_sinr, norm_range, phase
+        ], dtype=float), sinr_lin
+
+    def _compute_state(self):
+        state = []
+        self._last_sinrs = []  # keep for reward shaping
+        for i in range(self.N_sats):
+            beam = self.detected_beams[i]
+            beam_center = self._compute_beam_center(beam)
+            feat, sinr_lin = self._beam_channel_features(beam_center)
+            self._last_sinrs.append(sinr_lin)
+            state.extend(feat.tolist())
+        return np.array(state, dtype=float)
+
+    # --------------------
+    # WLS position (2D, 單純位置，單位：公尺)
+    # --------------------
     def _compute_wls_position(self, weights):
         H = []
         z = []
-        W = np.diag(weights)
-        
+        W = np.diag(weights + 1e-12)
+
         for i in range(self.N_sats):
             beam_center = self._compute_beam_center(self.detected_beams[i])
-            distance = np.linalg.norm(beam_center - self.UT_position)
-            
-            h_i = (beam_center - self.UT_position) / (distance + 1e-10)
+            vec = self.UT_position - beam_center  # m
+            distance_m = np.linalg.norm(vec) + 1e-12
+            h_i = (self.UT_position - beam_center) / distance_m
             H.append(h_i)
-            z.append(distance)
-        
-        H = np.array(H)
-        z = np.array(z)
-        
+            z.append(distance_m)
+
+        H = np.array(H)  # (N,2)
+        z = np.array(z)  # (N,)
+
         try:
             H_T_W = H.T @ W
             H_T_W_H = H_T_W @ H
             H_T_W_z = H_T_W @ z
-            
             regularization = 1e-6 * np.eye(2)
             position_delta = np.linalg.solve(H_T_W_H + regularization, H_T_W_z)
-            
-            estimated_position = self.UT_position + position_delta
+            estimated_position = self.UT_position + position_delta  # m
             return estimated_position
-            
         except np.linalg.LinAlgError:
-            return self.UT_position
-    
+            return self.UT_position.copy()
+
     def _compute_error(self, weights):
+        """
+        回傳：
+        - position_error_m：真正的定位誤差（公尺）
+        - error_for_rl：給 RL 用的誤差（以 km 尺度，方便沿用原本 reward 設計）
+        """
         predicted_position = self._compute_wls_position(weights)
-        position_error = np.linalg.norm(predicted_position - self.UT_position)
-        weight_regularization = np.abs(np.sum(weights) - 1.0)
-        return position_error + 0.1 * weight_regularization
-    
+        position_error_m = np.linalg.norm(predicted_position - self.UT_position)  # m
+        weight_regularization = abs(np.sum(weights) - 1.0)
+        error_km_like = position_error_m / 1000.0  # 轉成 km 尺度
+        error_for_rl = error_km_like + 0.1 * weight_regularization
+        return position_error_m, error_for_rl
+
     def step(self, action):
-        weights = np.clip(action, 0, 1)
-        error = self._compute_error(weights)
-        reward = -np.exp(error / 10.0) + 1
+        self._update_dynamic_beam_radius()
+        weights = np.clip(action, 0.0, 1.0)
+        # L1-normalize weights to be consistent with paper (sum=1)
+        s = np.sum(weights) + 1e-12
+        weights = weights / s
+
+        position_error_m, error_for_rl = self._compute_error(weights)
+
+        # Reward with SINR shaping (error 用 km 尺度，SINR 做小補償)
+        error_km = position_error_m / 1000.0
+        mean_sinr_norm = np.mean([
+            min(1.0, max(0.0, (10*np.log10(s+1e-18) - self.snr_db_clip[0]) /
+                (self.snr_db_clip[1]-self.snr_db_clip[0]+1e-12)))
+            for s in self._last_sinrs
+        ])
+        reward = -np.exp(error_km / 10.0) + 1.0 + 0.05 * (mean_sinr_norm - 0.5)
+
         self.state = self._compute_state()
-        done = error < 1.0 or np.random.rand() > 0.95
-        return self.state, reward, done, {'error': error}
-    
+        # 終止條件改成「定位誤差 < 1000 m」或隨機結束
+        done = (position_error_m < 1_000.0) or (np.random.rand() > 0.95)
+
+        info = {
+            'error_m': float(position_error_m),
+            'error_km': float(error_km)
+        }
+        return self.state, reward, done, info
+
+    # --------------------
+    # Visualization  （全部改成顯示「公尺」）
+    # --------------------
     def visualize_beams(self, weights=None, episode=None, final=False):
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
-        # --- Draw intersection area (ALG.B) ---
-        detected_polygons = [self._create_circle_polygon(self._compute_beam_center(beam), 
-                                                    self.beam_radius/5) for beam in self.detected_beams]
+
+        ax1.text(0.5, 1.1, 'ALG.B', 
+                 bbox=dict(facecolor='white', edgecolor='black', pad=5),
+                 fontsize=12, ha='center', transform=ax1.transAxes)
+
+        detected_polygons = [
+            self._create_circle_polygon(self._compute_beam_center(beam),
+                                        self.beam_radius/5.0)
+            for beam in self.detected_beams
+        ]
         intersection = cascaded_union(detected_polygons)
-        
-        if undetected_polygons := [self._create_circle_polygon(self._compute_beam_center(beam), 
-                                                            self.beam_radius/5) for beam in self.undetected_beams]:
+
+        if undetected_polygons := [
+            self._create_circle_polygon(self._compute_beam_center(beam),
+                                        self.beam_radius/5.0)
+            for beam in self.undetected_beams
+        ]:
             for polygon in undetected_polygons:
                 if intersection.intersects(polygon):
                     intersection = intersection.difference(polygon)
-        
+
         if not intersection.is_empty:
             if intersection.geom_type == 'Polygon':
                 x, y = intersection.exterior.xy
@@ -133,80 +357,84 @@ class BeamEnv:
                 for geom in intersection.geoms:
                     x, y = geom.exterior.xy
                     ax1.fill(x, y, alpha=0.3, fc='gray', ec='none')
-        
-        # --- Original ALG.B ---
-        predicted_position_algb = self._compute_intersection_centroid(self.detected_beams, self.undetected_beams)
+
+        predicted_position_algb = self._compute_intersection_centroid(
+            self.detected_beams, self.undetected_beams
+        )
         ax1.plot(predicted_position_algb[0], predicted_position_algb[1], '*', 
-                color='yellow', markersize=20, label='Predicted Position')
-        distance_algb = np.linalg.norm(predicted_position_algb - self.UT_position)
-        ax1.text(0.02, 1.12, f'Distance Error: {distance_algb*1000:.2f} m', 
-                transform=ax1.transAxes, verticalalignment='top',
-                fontsize=18)
-        
-        # --- Proposed DQN-WLS ---
+                 color='yellow', markersize=20, label='Predicted Position')
+
+        # 顯示用誤差（公尺）
+        distance_algb_m = np.linalg.norm(predicted_position_algb - self.UT_position)
+        ax1.text(0.02, 0.98, f'Distance Error: {distance_algb_m:.2f} m', 
+                 transform=ax1.transAxes, verticalalignment='top')
+
+        ax2.text(0.5, 1.1, 'Proposed DQN-WLS', 
+                 bbox=dict(facecolor='white', edgecolor='black', pad=5),
+                 fontsize=12, ha='center', transform=ax2.transAxes)
+
         if weights is not None and final:
             predicted_position_wls = self._compute_wls_position(weights)
             ax2.plot(predicted_position_wls[0], predicted_position_wls[1], '*', 
-                    color='yellow', markersize=20, label='Predicted Position')
-            distance_wls = np.linalg.norm(predicted_position_wls - self.UT_position)
-            ax2.text(0.02,1.12, f'Distance Error: {distance_wls*1000:.2f} m', 
-                    transform=ax2.transAxes, verticalalignment='top',
-                    fontsize=18)
-        
-        # --- Draw beams ---
+                     color='yellow', markersize=20, label='Predicted Position')
+
+            distance_wls_m = np.linalg.norm(predicted_position_wls - self.UT_position)
+            ax2.text(0.02, 0.98, f'Distance Error: {distance_wls_m:.2f} m', 
+                     transform=ax2.transAxes, verticalalignment='top')
+
         for i in range(self.N_sats):
+            # Detected beams (blue)
             beam = self.detected_beams[i]
             beam_center = self._compute_beam_center(beam)
-            weight = weights[i] if weights is not None else 1.0
+            weight = weights[i] if (weights is not None and i < len(weights)) else 1.0
             linewidth = 1.5 + 2.5 * weight if weights is not None else 1.5
             for ax in [ax1, ax2]:
-                circle = Circle(beam_center, self.beam_radius/5,
-                            color='blue', alpha=0.6, fill=False, linewidth=linewidth)
+                circle = Circle(beam_center, self.beam_radius/5.0,
+                                color='blue', alpha=0.6, fill=False, linewidth=linewidth)
                 ax.add_patch(circle)
-            
-            beam = self.undetected_beams[i]
-            beam_center = self._compute_beam_center(beam)
-            inverse_weight = 1 - weight if weights is not None else 0.0
+
+            # Undetected beams (red)
+            beam_u = self.undetected_beams[i]
+            beam_center_u = self._compute_beam_center(beam_u)
+            inverse_weight = 1 - (weight if weights is not None else 0.0)
             linewidth = 1.5 + 2.5 * inverse_weight if weights is not None else 1.5
             for ax in [ax1, ax2]:
-                circle = Circle(beam_center, self.beam_radius/5,
-                            color='red', alpha=0.6, fill=False, linewidth=linewidth)
+                circle = Circle(beam_center_u, self.beam_radius/5.0,
+                                color='red', alpha=0.6, fill=False, linewidth=linewidth)
                 ax.add_patch(circle)
-        
-        # --- Common settings ---
+
+        # 座標軸：±20 km → 以公尺顯示
         for ax in [ax1, ax2]:
-            ax.plot(self.UT_position[0], self.UT_position[1], 'ko', 
-                markerfacecolor='none', markersize=10)
-            ax.add_patch(Circle(self.UT_position, self.beam_radius/10, 
-                            color='gray', alpha=0.3))
-            ax.set_xlim(-20, 20)
-            ax.set_ylim(-20, 20)
-            ax.set_xlabel('X (m)', fontsize=18)
-            ax.set_ylabel('Y (m)', fontsize=18)
+            ax.plot(self.UT_position[0], self.UT_position[1], 'ko',
+                    markerfacecolor='none', markersize=10)
+            ax.add_patch(Circle(self.UT_position, self.beam_radius/10.0,
+                                color='gray', alpha=0.3))
+            ax.set_xlim(-20_000.0, 20_000.0)
+            ax.set_ylim(-20_000.0, 20_000.0)
+            ax.set_xlabel('X (m)')
+            ax.set_ylabel('Y (m)')
             ax.grid(True, linestyle='--', alpha=0.7)
-        
-        # --- Subfigure labels below X-axis ---
-        ax1.text(0.5, -0.18, '(a) ALG-B', transform=ax1.transAxes,
-                ha='center', va='center', fontsize=18, fontweight='bold')
-        ax2.text(0.5, -0.18, '(b) DQN-WLS', transform=ax2.transAxes,
-                ha='center', va='center', fontsize=18, fontweight='bold')
-        
-        # --- Legend ---
+
         legend_elements = [
             plt.Line2D([0], [0], marker='o', color='blue', linestyle='none',
-                    label='Detected Beams', markersize=10, markerfacecolor='none'),
+                       label='Detected Beams', markersize=10, markerfacecolor='none'),
             plt.Line2D([0], [0], marker='o', color='red', linestyle='none',
-                    label='Undetected Beams', markersize=10, markerfacecolor='none'),
+                       label='Undetected Beams', markersize=10, markerfacecolor='none'),
             plt.Line2D([0], [0], marker='o', color='k', linestyle='none',
-                    markerfacecolor='none', markersize=10, label='Actual UT Position'),
+                       markerfacecolor='none', markersize=10, label='Actual UT Position'),
             plt.Line2D([0], [0], marker='*', color='yellow', linestyle='none',
-                    label='Predicted Position', markersize=15)
+                       label='Predicted Position', markersize=15)
         ]
-        ax2.legend(handles=legend_elements, bbox_to_anchor=(0.99, 1), loc='upper left',fontsize=12)
-        
-        plt.tight_layout(pad=3.0)
+        ax2.legend(handles=legend_elements, bbox_to_anchor=(1.05, 1), loc='upper left')
+
+        if episode is not None:
+            plt.suptitle(f'Training Episode {episode}')
+        plt.tight_layout()
         plt.show()
 
+# ==============================
+# DQN
+# ==============================
 
 class DQN(nn.Module):
     def __init__(self, state_dim, action_dim):
@@ -214,110 +442,147 @@ class DQN(nn.Module):
         self.fc1 = nn.Linear(state_dim, 128)
         self.fc2 = nn.Linear(128, 128)
         self.fc3 = nn.Linear(128, action_dim)
+
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
         return torch.sigmoid(self.fc3(x))
 
-
 def train_dqn(visualize_interval=1000):
-    state_dim, action_dim = 10, 10
-    gamma, epsilon, epsilon_decay, min_epsilon = 0.99, 1.0, 0.995, 0.01
+    # 6 features/beam * 10 beams = 60
+    state_dim = 6 * 10
+    action_dim = 10
+    gamma = 0.99
+    epsilon = 1.0
+    epsilon_decay = 0.995
+    min_epsilon = 0.01
     replay_buffer = deque(maxlen=10000)
-    batch_size, num_episodes = 64, 1000
-    dqn, target_dqn = DQN(state_dim, action_dim), DQN(state_dim, action_dim)
+    batch_size = 64
+    num_episodes = 1000
+
+    dqn = DQN(state_dim, action_dim)
+    target_dqn = DQN(state_dim, action_dim)
     target_dqn.load_state_dict(dqn.state_dict())
+
     optimizer = optim.Adam(dqn.parameters(), lr=1e-3)
     loss_fn = nn.MSELoss()
-    env = BeamEnv(N_sats=10, beam_radius=50, beam_sep=75, UT_position=[0, 0])
-    rewards_per_episode, errors_per_episode, final_weights = [], [], None
+
+    # 建立環境（全部使用「公尺」）
+    env = BeamEnv(
+        N_sats=10,
+        beam_radius=50_000.0,   # 50 km
+        beam_sep=75_000.0,      # 75 km
+        UT_position=[0.0, 0.0]
+    )
+
+    rewards_per_episode = []
+    errors_per_episode = []   # 存「公尺」誤差
+    final_weights = None
 
     for episode in range(num_episodes):
-        state, total_reward, episode_errors = env.reset(), 0, []
-        if episode % visualize_interval == 0 and final_weights is not None:
-            env.visualize_beams(weights=final_weights, episode=episode, final=True)
+        state = env.reset()
+        total_reward = 0.0
+        episode_errors_m = []
 
-        for _ in range(1000):
+        if episode % visualize_interval == 0:
+            if final_weights is not None:
+                env.visualize_beams(weights=final_weights,
+                                    episode=episode, final=True)
+
+        for t in range(1000):
             if random.random() < epsilon:
                 action = np.random.rand(action_dim)
             else:
                 with torch.no_grad():
                     action = dqn(torch.FloatTensor(state)).numpy()
+
             next_state, reward, done, info = env.step(action)
-            total_reward += reward
-            episode_errors.append(info['error'])
+            total_reward += float(reward)
+            episode_errors_m.append(float(info['error_m']))
+
             replay_buffer.append((state, action, reward, next_state, done))
             state = next_state
 
             if len(replay_buffer) > batch_size:
                 batch = random.sample(replay_buffer, batch_size)
-                states, actions, rewards, next_states, dones = zip(*batch)
-                states, actions, rewards, next_states, dones = map(torch.FloatTensor,
-                    [states, actions, rewards, next_states, dones])
+                states, actions, rewards_b, next_states, dones = zip(*batch)
+
+                states = torch.FloatTensor(states)
+                actions = torch.FloatTensor(actions)
+                rewards_t = torch.FloatTensor(rewards_b)
+                next_states = torch.FloatTensor(next_states)
+                dones_t = torch.FloatTensor(dones)
+
                 with torch.no_grad():
-                    target_q = rewards + gamma * (1 - dones) * torch.max(target_dqn(next_states), dim=1)[0]
-                current_q = torch.sum(dqn(states) * actions, dim=1)
-                loss = loss_fn(current_q, target_q)
-                optimizer.zero_grad(); loss.backward(); optimizer.step()
-            if done: break
+                    target_q_values = rewards_t + gamma * (1 - dones_t) * \
+                        torch.max(target_dqn(next_states), dim=1)[0]
+
+                current_q_values = torch.sum(dqn(states) * actions, dim=1)
+                loss = loss_fn(current_q_values, target_q_values)
+
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(dqn.parameters(), max_norm=5.0)
+                optimizer.step()
+
+            if done:
+                break
 
         epsilon = max(min_epsilon, epsilon * epsilon_decay)
         if episode % 10 == 0:
             target_dqn.load_state_dict(dqn.state_dict())
+
         rewards_per_episode.append(total_reward)
-        errors_per_episode.append(np.mean(episode_errors))
+        errors_per_episode.append(np.mean(episode_errors_m))
+
         if episode == num_episodes - 1:
             final_weights = action
-            env.visualize_beams(weights=final_weights, episode=episode, final=True)
+            env.visualize_beams(weights=final_weights,
+                                episode=episode, final=True)
+
         if episode % 50 == 0:
-            print(f"訓練回合 {episode}, 總獎勵: {total_reward:.2f}, 平均誤差: {np.mean(episode_errors):.2f}")
+            avg_error_m = np.mean(episode_errors_m)
+            print(f"訓練回合 {episode}, 總獎勵: {total_reward:.2f}, "
+                  f"平均誤差: {avg_error_m:.2f} m")
+
         torch.save(dqn.state_dict(), "trained_dqn_weights.pth")
+
     return rewards_per_episode, errors_per_episode, final_weights, env
 
+if __name__ == "__main__":
+    print("Starting training with Channel-Integrated Env (meters)...")
+    rewards, errors_m, final_weights, env = train_dqn(visualize_interval=1000)
 
-# --- Training ---
-print("Starting training...")
-rewards, errors, final_weights, env = train_dqn(visualize_interval=10)
-end_time = time.time()
-print(f"程式總執行時間: {end_time - start_time:.2f} 秒")
+    # Plot training results
+    plt.figure(figsize=(12, 6))
 
-# --- Plot reward/error curves ---
-plt.figure(figsize=(12, 6))
-window_size = 50
+    # Reward 曲線
+    plt.subplot(1, 2, 1)
+    plt.plot(rewards)
+    plt.xlabel("Training Episodes")
+    plt.ylabel("Total Reward")
+    plt.title("Reward Variation During Training")
+    plt.grid()
 
-# --- Reward Plot ---
-plt.subplot(1, 2, 1)
-plt.plot(rewards, label='Raw Reward', color='steelblue')
-if len(rewards) >= window_size:
-    ma = np.convolve(rewards, np.ones(window_size)/window_size, mode='valid')
-    plt.plot(range(window_size - 1, len(rewards)), ma, color='orange', label=f'Smoothed Reward')
+    # Error 曲線（公尺）
+    plt.subplot(1, 2, 2)
+    plt.plot(errors_m)
+    plt.xlabel("Training Episodes")
+    plt.ylabel("Average Error (m)")
+    plt.title("Localization Error Variation During Training")
+    plt.grid()
 
-# 移除標題，放大座標軸與圖例字體
-plt.xlabel("Episodes", fontsize=18)
-plt.ylabel("Reward", fontsize=18)
-plt.legend(fontsize=14)
-plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
 
-# --- Error Plot ---
-plt.subplot(1, 2, 2)
-errors_m = np.array(errors) * 1000
-plt.plot(errors_m, label='Raw Error', color='steelblue')
-if len(errors_m) >= window_size:
-    ma = np.convolve(errors_m, np.ones(window_size)/window_size, mode='valid')
-    plt.plot(range(window_size - 1, len(errors_m)), ma, color='orange', label=f'Smoothed Error')
+    # 最後權重分布
+    plt.figure(figsize=(8, 4))
+    normalized_weights = final_weights / (np.sum(final_weights) + 1e-12)
+    plt.bar(range(len(normalized_weights)), normalized_weights)
+    plt.xlabel("Beam Index")
+    plt.ylabel("Weight")
+    plt.title("Final Beam Weight Distribution")
+    plt.grid()
+    plt.show()
 
-plt.xlabel("Episodes", fontsize=18)
-plt.ylabel("Error (m)", fontsize=18)
-plt.legend(fontsize=14)
-plt.grid(True, linestyle='--', alpha=0.7)
-
-plt.tight_layout(pad=3.0)
-plt.show()
-
-# --- Plot final beam weight distribution ---
-plt.figure(figsize=(8, 4))
-normalized_weights = final_weights / np.sum(final_weights)
-plt.bar(range(len(normalized_weights)), normalized_weights)
-plt.xlabel("Beam Index",fontsize=18); plt.ylabel("Weight",fontsize=18)
-plt.grid(); plt.show()
-print("Training completed!")
+    print("Training completed with Channel Model (meters)!")
