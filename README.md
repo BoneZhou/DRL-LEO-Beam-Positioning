@@ -5,7 +5,9 @@ The Python code for DRL-Based Beam Positioning for LEO Satellite Constellations 
   * DDQN [3]
   * DQN [4]
   * ALG-B (Beam-Based Positioning) [5]
+  * ALG-B_Channel (Beam-Based Positioning) [5] With Channel Considerations
   * LSTM-WLS [6]
+  * LSTM-WLS_Channel [6] With Channel Considerations
 
 [1] Po-Heng Chou, Chiapin Wang, Kuan-Hao Chen, Wei-Chen Hsiao, "DRL-Based Beam Positioning for LEO Satellite Constellations with Weighted Least Squares," arXiv preprint arXiv:2511.08852, 2025.
 
