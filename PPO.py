@@ -1,5 +1,5 @@
 # ===============================================================
-# ppo_meters_fast.py — PPO 版 (Dirichlet Policy, 無 WLS, 單一 UT)
+# ppo_meters_fast.py — PPO 版 (Dirichlet Policy, 無 WLS, 單一 UT) + Doppler
 # ===============================================================
 
 import time
@@ -69,6 +69,10 @@ class BeamEnv:
         self.altitude_m = altitude_km * 1000.0
         self.n_interferers = n_interferers
         self.snr_db_clip = snr_db_clip
+        
+        # [New] LEO 衛星速度 (m/s)
+        self.SAT_VELOCITY_MAG = 7560.0
+        
         # caches
         self._last_sinrs_lin = np.ones(self.N_sats, dtype=np.float32)
         self._last_pseudoranges_m = np.zeros(self.N_sats, dtype=np.float32)
@@ -77,6 +81,10 @@ class BeamEnv:
     def reset(self):
         self.detected_beams = self._generate_beam_positions()
         self.undetected_beams = self._generate_beam_positions()
+        
+        # [New] Reset velocities
+        self.sat_velocities = self._generate_velocities()
+        
         self.state = self._compute_state()
         return self.state
 
@@ -85,6 +93,15 @@ class BeamEnv:
         start_points = self.UT_position + center_offset + np.random.uniform(-5, 5, (self.N_sats, 2)).astype(np.float32)
         end_points = start_points + np.random.uniform(-3, 3, (self.N_sats, 2)).astype(np.float32)
         return np.stack([start_points, end_points], axis=1)
+    
+    # [New] Generate Satellite Velocities
+    def _generate_velocities(self):
+        # 假設衛星在水平面上隨機運動 (簡化模型)
+        angles = np.random.uniform(0, 2*np.pi, self.N_sats)
+        vx = self.SAT_VELOCITY_MAG * np.cos(angles)
+        vy = self.SAT_VELOCITY_MAG * np.sin(angles)
+        vz = np.zeros(self.N_sats)
+        return np.stack([vx, vy, vz], axis=1).astype(np.float32)
 
     def _beam_center(self, beam):
         return (beam[0] + beam[1]) / 2.0
@@ -123,33 +140,68 @@ class BeamEnv:
         beta = np.sqrt(self.Gt * self.Gr / L)
         return beta * a
 
-    def _beam_channel_features(self, beam_center_xy_km):
+    # [Modified] Add velocity input
+    def _beam_channel_features(self, beam_center_xy_km, sat_velocity_ms):
         ut_xyz_km = np.array([self.UT_position[0], self.UT_position[1], 0.0], dtype=np.float32)
         sat_xyz_km = np.array([beam_center_xy_km[0], beam_center_xy_km[1], self.altitude_km], dtype=np.float32)
+        
         g, d_m, az, el = self._upa_channel_vector(sat_xyz_km, ut_xyz_km)
         thx, thy = direction_cosines_from_az_el(az, el)
         f_des = upa_steering_vector(self.Nx, self.Ny, thx, thy)
         f_des = f_des / (np.linalg.norm(f_des) + 1e-12)
+        
         interf_powers = 0.0
         for _ in range(self.n_interferers):
             f_k = self._random_interferer(sat_xyz_km, ut_xyz_km)
             interf_powers += np.abs(np.vdot(g, f_k))**2
+            
         signal_power = np.abs(np.vdot(g, f_des))**2
         noise_power = self._thermal_noise_watts()
         sinr_lin = signal_power / (interf_powers + noise_power + 1e-18)
         sinr_db = 10.0 * np.log10(max(sinr_lin, 1e-18))
+        
+        # 1. Dist
         d_km = d_m / 1000.0
         norm_distance = np.clip(d_km / 1000.0, 0.0, 1.0)
+        
+        # 2. Angle
         norm_az = (az + np.pi) / (2.0*np.pi)
         norm_el = (el + (np.pi/2.0)) / np.pi
+        
+        # 3. SNR
         min_db, max_db = self.snr_db_clip
         sinr_db_clipped = np.clip(sinr_db, min_db, max_db)
         norm_sinr = (sinr_db_clipped - min_db) / (max_db - min_db + 1e-12)
+        
+        # 4. Pseudo-range
         sigma_m = 30.0 / np.sqrt(1.0 + sinr_lin)
         pseudo_range_m = d_m + np.random.normal(0.0, sigma_m)
         norm_range = np.clip(pseudo_range_m / (self.altitude_m + 1e-12), 0.0, 1.0)
+        
+        # 5. [New] Doppler (Hz)
+        vec_sat_ut_m = (ut_xyz_km - sat_xyz_km) * 1000.0
+        dist_m = np.linalg.norm(vec_sat_ut_m) + 1e-12
+        u_los = vec_sat_ut_m / dist_m # Unit vector
+        
+        # True Range Rate = dot(v, u)
+        true_rr = np.dot(sat_velocity_ms, u_los)
+        
+        # Convert to Hz: f_d = v / lambda
+        true_doppler_hz = true_rr / self.lam
+        
+        # Add Noise N(0, 5)
+        measured_doppler_hz = true_doppler_hz + np.random.normal(0, 5.0)
+        
+        # Normalize
+        max_doppler_hz = (self.SAT_VELOCITY_MAG + 100.0) / self.lam
+        norm_doppler = (measured_doppler_hz / max_doppler_hz + 1.0) / 2.0
+        norm_doppler = np.clip(norm_doppler, 0.0, 1.0)
+
+        # 6. Phase
         phase = (pseudo_range_m % self.lam) / self.lam
-        feat = np.array([norm_distance, norm_az, norm_el, norm_sinr, norm_range, phase], dtype=np.float32)
+        
+        # Output 7 features
+        feat = np.array([norm_distance, norm_az, norm_el, norm_sinr, norm_range, norm_doppler, phase], dtype=np.float32)
         return feat, sinr_lin, pseudo_range_m
 
     def _compute_state(self):
@@ -158,10 +210,15 @@ class BeamEnv:
         pranges = []
         for i in range(self.N_sats):
             c = self._beam_center(self.detected_beams[i])
-            feat, s_lin, pr_m = self._beam_channel_features(c)
+            v = self.sat_velocities[i]
+            
+            # Pass velocity to feature computation
+            feat, s_lin, pr_m = self._beam_channel_features(c, v)
+            
             feats.extend(feat.tolist())
             sinrs.append(s_lin)
             pranges.append(pr_m)
+            
         self._last_sinrs_lin = np.array(sinrs, dtype=np.float32)
         self._last_pseudoranges_m = np.array(pranges, dtype=np.float32)
         return np.array(feats, dtype=np.float32)
@@ -199,6 +256,11 @@ class BeamEnv:
         reward = -np.exp(error_km / 10.0) + 1.0
         self.detected_beams = self._generate_beam_positions()
         self.undetected_beams = self._generate_beam_positions()
+        
+        # New velocities for new episode step? 
+        # Usually physics is continuous, but here we reset geometry every step for "fast" training
+        self.sat_velocities = self._generate_velocities()
+        
         self.state = self._compute_state()
         done = (error_km < 0.001) or (np.random.rand() > 0.98)
         return self.state, float(reward), bool(done), {"error_km": error_km}
@@ -310,11 +372,13 @@ class PPO:
 
 
 # ---------------- Training ----------------
-def train_ppo(total_episodes=50, rollout_steps=256
+def train_ppo(total_episodes=1000, rollout_steps=1024
               , update_epochs=10, minibatch_size=128, device='cpu'):
     start_time = time.time()
     env = BeamEnv()
-    state_dim, action_dim = 60, 10
+    
+    # [Modified] State dimension = 70 (7 features * 10 satellites)
+    state_dim, action_dim = 70, 10
     agent = PPO(state_dim, action_dim, device=device)
 
     ep_rewards, ep_errors_m, weights_hist = [], [], []
@@ -350,7 +414,7 @@ def train_ppo(total_episodes=50, rollout_steps=256
     mf=pf+vf; rf=total_episodes*rollout_steps*mf
     mb=int(np.ceil(rollout_steps/minibatch_size))*update_epochs*total_episodes; uf=3*mb*mf; tf=rf+uf
 
-    print('========== PPO 訓練摘要 ==========')
+    print('========== PPO (with Doppler) 訓練摘要 ==========')
     print(f'[Model FLOPs] 每次 forward 約 {mf/1e6:.2f} M FLOPs')
     print(f'[Training FLOPs] Rollout 累計 ≈ {rf/1e9:.2f} GFLOPs')
     print(f'[Training FLOPs] Update 累計 ≈ {uf/1e9:.2f} GFLOPs')
@@ -401,5 +465,5 @@ def train_ppo(total_episodes=50, rollout_steps=256
     return ep_rewards, ep_errors_m, env
 
 if __name__=='__main__':
-    print('Starting PPO training (single UT, fast mode)...')
+    print('Starting PPO training (single UT, fast mode) with Doppler...')
     train_ppo(device='cpu')

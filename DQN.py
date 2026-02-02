@@ -9,6 +9,7 @@ from matplotlib.patches import Circle
 from shapely.geometry import Polygon
 from shapely.ops import cascaded_union
 import time
+
 start_time = time.time()
 
 # ----- Channel geometry helpers (for UPA + channel model) -----
@@ -32,7 +33,6 @@ def upa_steering_vector(Nx, Ny, thx, thy):
     ay = np.exp(-1j * np.pi * thy * np.arange(Ny)) / np.sqrt(Ny)
     a = np.kron(ax, ay)
     return a
-
 
 
 class BeamEnv:
@@ -67,6 +67,10 @@ class BeamEnv:
         self.altitude_m = altitude_km * 1000.0
         self.n_interferers = n_interferers
         self.snr_db_clip = snr_db_clip
+        
+        # [New] LEO 衛星速度 (m/s)
+        self.SAT_VELOCITY_MAG = 7560.0
+
         # caches for logging
         self._last_sinrs_lin = np.ones(self.N_sats)
         self._last_pseudoranges_m = np.zeros(self.N_sats)
@@ -75,6 +79,10 @@ class BeamEnv:
     def reset(self):
         self.detected_beams = self._generate_beam_positions()
         self.undetected_beams = self._generate_beam_positions()
+        
+        # [New] 重置時生成隨機衛星速度向量 (3D, m/s)
+        self.sat_velocities = self._generate_velocities()
+        
         self.state = self._compute_state()
         return self.state
     
@@ -84,6 +92,15 @@ class BeamEnv:
         end_points = start_points + np.random.uniform(-3, 3, (self.N_sats, 2))
         return np.stack([start_points, end_points], axis=1)
     
+    # [New] 生成衛星速度向量
+    def _generate_velocities(self):
+        # 假設衛星在軌道面上隨機方向運動 (簡化為水平面隨機)
+        angles = np.random.uniform(0, 2*np.pi, self.N_sats)
+        vx = self.SAT_VELOCITY_MAG * np.cos(angles)
+        vy = self.SAT_VELOCITY_MAG * np.sin(angles)
+        vz = np.zeros(self.N_sats) # 簡化假設垂直速度為 0
+        return np.stack([vx, vy, vz], axis=1)
+
     # ---------- Channel-related helpers ----------
     def _thermal_noise_watts(self):
         N0 = self.kB * self.temperature * self.bandwidth
@@ -118,33 +135,72 @@ class BeamEnv:
         beta = np.sqrt(self.Gt * self.Gr / L)
         return beta * a
 
-    def _beam_channel_features(self, beam_center_xy_km):
+    # [Modified] 增加 velocity 參數
+    def _beam_channel_features(self, beam_center_xy_km, sat_velocity_ms):
         ut_xyz_km = np.array([self.UT_position[0], self.UT_position[1], 0.0])
         sat_xyz_km = np.array([beam_center_xy_km[0], beam_center_xy_km[1], self.altitude_km])
+        
         g, d_m, az, el = self._upa_channel_vector(sat_xyz_km, ut_xyz_km)
         thx, thy = direction_cosines_from_az_el(az, el)
         f_des = upa_steering_vector(self.Nx, self.Ny, thx, thy)
         f_des = f_des / (np.linalg.norm(f_des) + 1e-12)
+        
         interf_powers = 0.0
         for _ in range(self.n_interferers):
             f_k = self._random_interferer(sat_xyz_km, ut_xyz_km)
             interf_powers += np.abs(np.vdot(g, f_k))**2
+            
         signal_power = np.abs(np.vdot(g, f_des))**2
         noise_power = self._thermal_noise_watts()
         sinr_lin = signal_power / (interf_powers + noise_power + 1e-18)
         sinr_db = 10.0 * np.log10(max(sinr_lin, 1e-18))
+        
+        # 1. Distance
         d_km = d_m / 1000.0
         norm_distance = np.clip(d_km / 1000.0, 0.0, 1.0)
+        
+        # 2. Angle
         norm_az = (az + np.pi) / (2.0*np.pi)
         norm_el = (el + (np.pi/2.0)) / np.pi
+        
+        # 3. SNR
         min_db, max_db = self.snr_db_clip
         sinr_db_clipped = np.clip(sinr_db, min_db, max_db)
         norm_sinr = (sinr_db_clipped - min_db) / (max_db - min_db + 1e-12)
+        
+        # 4. Pseudo-range
         sigma_m = 30.0 / np.sqrt(1.0 + sinr_lin)
         pseudo_range_m = d_m + np.random.normal(0.0, sigma_m)
         norm_range = np.clip(pseudo_range_m / (self.altitude_m + 1e-12), 0.0, 1.0)
+        
+        # 5. [New] Doppler (Hz)
+        # 計算視線向量 u_vec (Sat -> UT)
+        vec_sat_ut = (ut_xyz_km - sat_xyz_km) * 1000.0 # meters
+        dist = np.linalg.norm(vec_sat_ut) + 1e-12
+        u_vec = vec_sat_ut / dist
+        
+        # True Range Rate (m/s) = dot(v_sat, u_vec)
+        # 物理上 Doppler shift fd = - (v_rel * fc) / c
+        # 這裡我們模擬接收到的 Range Rate 相關數值
+        true_range_rate = np.dot(sat_velocity_ms, u_vec) 
+        
+        # 轉成 Hz: f_d = (v / c) * f_c
+        true_doppler_hz = (true_range_rate / self.c) * self.fc
+        
+        # 表格要求: 加入 N(0, 5) Hz 的誤差
+        measured_doppler_hz = true_doppler_hz + np.random.normal(0, 5.0)
+        
+        # 正規化: LEO 最大都普勒約 +/- 7.6 km/s 對應的頻率
+        # Max Doppler approx (7600 / 3e8) * 12e9 = 304,000 Hz
+        max_doppler_hz = (self.SAT_VELOCITY_MAG + 100.0) / self.c * self.fc
+        norm_doppler = (measured_doppler_hz / max_doppler_hz + 1.0) / 2.0
+        norm_doppler = np.clip(norm_doppler, 0.0, 1.0)
+
+        # 6. Phase
         phase = (pseudo_range_m % self.lam) / self.lam
-        feat = np.array([norm_distance, norm_az, norm_el, norm_sinr, norm_range, phase], dtype=float)
+        
+        # 組合 7 個特徵
+        feat = np.array([norm_distance, norm_az, norm_el, norm_sinr, norm_range, norm_doppler, phase], dtype=float)
         return feat, sinr_lin, pseudo_range_m
 
     def _compute_state(self):
@@ -153,8 +209,12 @@ class BeamEnv:
         pranges = []
         for i in range(self.N_sats):
             beam = self.detected_beams[i]
+            vel = self.sat_velocities[i] # [New] 取得該衛星速度
             beam_center = self._compute_beam_center(beam)
-            feat, s_lin, pr_m = self._beam_channel_features(beam_center)
+            
+            # 傳入 velocity 計算 Doppler
+            feat, s_lin, pr_m = self._beam_channel_features(beam_center, vel)
+            
             state.extend(feat.tolist())
             sinrs.append(s_lin)
             pranges.append(pr_m)
@@ -313,7 +373,10 @@ class DQN(nn.Module):
         return torch.sigmoid(self.fc3(x))
 
 def train_dqn(visualize_interval=1000):
-    state_dim, action_dim = 60, 10
+    # [Modified] state_dim 從 60 改為 70 (每個 beam 增加 Doppler 特徵)
+    # 7 features * 10 beams = 70
+    state_dim, action_dim = 70, 10
+    
     gamma, epsilon, epsilon_decay, min_epsilon = 0.99, 1.0, 0.995, 0.01
     replay_buffer = deque(maxlen=10000)
     batch_size, num_episodes = 64, 1000
@@ -367,7 +430,7 @@ def train_dqn(visualize_interval=1000):
     return rewards_per_episode, errors_per_episode, final_weights, env
 
 print("Starting training...")
-rewards, errors, final_weights, env = train_dqn(visualize_interval=10)
+rewards, errors, final_weights, env = train_dqn(visualize_interval=100)
 end_time = time.time()
 print(f"程式總執行時間: {end_time - start_time:.2f} 秒")
 

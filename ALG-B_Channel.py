@@ -44,6 +44,9 @@ fading_sigma_dB = 2.0   # 小尺度衰落(簡化成高斯在 dB) 標準差
 # 偵測門檻 (可以用 SNR 也可以用接收功率)
 snr_det_threshold_dB = 0.0   # SNR >= 0 dB 視為「有成功解出 beam ID」
 
+# [New] 都普勒參數
+SAT_VELOCITY_MAG = 7560.0 # m/s (LEO 典型速度)
+
 
 # =========================
 #      通道模型函式
@@ -52,8 +55,6 @@ snr_det_threshold_dB = 0.0   # SNR >= 0 dB 視為「有成功解出 beam ID」
 def compute_snr_and_prx(beam_center_km, ut_pos_km):
     """
     計算某個波束中心到 UT 的接收功率與 SNR (單一 snapshot)
-    - beam_center_km: 波束中心在地面的 (x, y) (km)
-    - ut_pos_km: UT 在地面的 (x, y) (km)
     """
     # 地面水平距離 (km)
     horiz_dist_km = np.linalg.norm(beam_center_km - ut_pos_km)  # km
@@ -77,6 +78,31 @@ def compute_snr_and_prx(beam_center_km, ut_pos_km):
     snr_dB = P_rx_dBm - noise_floor_dBm
 
     return snr_dB, P_rx_dBm
+
+def compute_doppler_hz(sat_pos_3d_km, sat_vel_ms, ut_pos_2d_km):
+    """
+    計算都普勒頻移
+    sat_pos_3d_km: (x, y, z)
+    sat_vel_ms: (vx, vy, vz) m/s
+    ut_pos_2d_km: (x, y)
+    """
+    ut_pos_3d_km = np.array([ut_pos_2d_km[0], ut_pos_2d_km[1], 0.0])
+    
+    # 視線向量 Sat -> UT
+    vec_km = ut_pos_3d_km - sat_pos_3d_km
+    dist_km = np.linalg.norm(vec_km) + 1e-12
+    u_vec = vec_km / dist_km # 單位向量
+    
+    # Range Rate = dot(v, u) (m/s)
+    range_rate = np.dot(sat_vel_ms, u_vec)
+    
+    # Doppler = (RangeRate / c) * fc = RangeRate / lambda
+    doppler_hz = range_rate / lam
+    
+    # 加入測量雜訊 N(0, 5)
+    measured_doppler_hz = doppler_hz + np.random.normal(0, 5.0)
+    
+    return measured_doppler_hz
 
 
 # =========================
@@ -103,12 +129,25 @@ ax[1].set_title('Positioning Results using ALG. B (with channel)')
 errors_A_km = []  # 儲存每個樣本的誤差 (ALG A)
 errors_B_km = []  # 儲存每個樣本的誤差 (ALG B)
 
+# [New] 儲存所有偵測到波束的都普勒值 (統計用)
+all_detected_dopplers = []
+
 last_CoG_A = None
 last_CoG_B = None
 
 for sample in range(N_samples):
-    # 隨機位移衛星 (簡化)
-    sat_positions = beam_sep * (np.random.rand(N_sats, 2) - 0.5)
+    # 1. 隨機生成衛星中心位置 (地面投影點)
+    sat_center_2d = beam_sep * (np.random.rand(N_sats, 2) - 0.5)
+    
+    # 2. [New] 隨機生成衛星速度向量 (假設在軌道面上水平運動)
+    sat_velocities = []
+    for _ in range(N_sats):
+        angle = np.random.uniform(0, 2*np.pi)
+        vx = SAT_VELOCITY_MAG * np.cos(angle)
+        vy = SAT_VELOCITY_MAG * np.sin(angle)
+        vz = 0.0
+        sat_velocities.append(np.array([vx, vy, vz]))
+    sat_velocities = np.array(sat_velocities)
 
     detected_beams = []     # 偵測到的波束中心 (ALG A/B 都會用到)
     undetected_beams = []   # R<d<=3R 且沒被偵測到的波束中心 (ALG B 用)
@@ -116,9 +155,14 @@ for sample in range(N_samples):
 
     # 為每一顆衛星產生波束
     for i in range(N_sats):
+        # 衛星 3D 位置 (假設位於波束群正上方)
+        sat_pos_3d = np.array([sat_center_2d[i][0], sat_center_2d[i][1], sat_alt_km])
+        sat_vel = sat_velocities[i]
+        
         for row in range(-2, 3):
             for col in range(-2, 3):
-                beam_center = sat_positions[i] + np.array([row, col]) * beam_sep
+                # 波束中心 (地面座標)
+                beam_center = sat_center_2d[i] + np.array([row, col]) * beam_sep
                 dist_ground = np.linalg.norm(beam_center - UT_true_pos)  # km
 
                 # 太遠的 beam 直接略過
@@ -127,15 +171,18 @@ for sample in range(N_samples):
 
                 # 計算通道 SNR & P_rx
                 snr_dB, P_rx_dBm = compute_snr_and_prx(beam_center, UT_true_pos)
+                
+                # [New] 計算 Doppler (雖然 ALG A/B 沒用到，但模擬環境已具備此資訊)
+                dop_hz = compute_doppler_hz(sat_pos_3d, sat_vel, UT_true_pos)
 
                 # -----------------------------
                 # ① footprint 內 (d <= R)
                 #    -> 若 SNR 過門檻, 當作「偵測到的 beam」
-                #    -> 若 SNR 太低, 直接無視 (不當作 undetected)
                 # -----------------------------
                 if dist_ground <= beam_radius:
                     if snr_dB >= snr_det_threshold_dB:
                         detected_beams.append(beam_center)
+                        all_detected_dopplers.append(dop_hz) # 紀錄 Doppler
 
                         # 在 ALG A 圖畫偵測 beam
                         circleA = plt.Circle(tuple(beam_center),
@@ -168,11 +215,13 @@ for sample in range(N_samples):
                                              fill=False)
                         ax[1].add_patch(circleB)
                     else:
-                        # 若側邊也偵測到，可選擇畫出 (這裡只是畫線，不影響演算法)
+                        # 若側邊也偵測到，畫出但不加入 undetected (因為被 detect 了)
                         circleB = plt.Circle(tuple(beam_center),
                                              beam_radius,
                                              fill=False)
                         ax[1].add_patch(circleB)
+                        # 雖然不是 main lobe，但如果是旁瓣偵測到，物理上也會有 Doppler
+                        all_detected_dopplers.append(dop_hz)
 
     # ========== ALG A：偵測到的波束交集 ==========
     if beam_shapes:
@@ -273,3 +322,12 @@ def summarize_errors(name, errs_km):
 print('\n===== Positioning Error (with channel) =====')
 summarize_errors('ALG A', errors_A_km)
 summarize_errors('ALG B', errors_B_km)
+
+# [New] 輸出 Doppler 統計
+if all_detected_dopplers:
+    dops = np.abs(np.array(all_detected_dopplers))
+    print('\n===== Doppler Statistics (Detected Beams) =====')
+    print(f'  Mean Abs Doppler: {np.mean(dops):.2f} Hz')
+    print(f'  Max Abs Doppler:  {np.max(dops):.2f} Hz')
+    print(f'  Min Abs Doppler:  {np.min(dops):.2f} Hz')
+    print(f'  (Simulated Velocity: {SAT_VELOCITY_MAG} m/s)')

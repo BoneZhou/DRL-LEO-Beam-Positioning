@@ -1,4 +1,3 @@
-
 import time
 import random
 import numpy as np
@@ -38,7 +37,7 @@ def upa_steering_vector(Nx, Ny, thx, thy):
     return a
 
 # ==============================
-# 環境：幾何 ALG-B + 通道模型
+# 環境：幾何 ALG-B + 通道模型 + 都普勒
 # ==============================
 
 class BeamEnv:
@@ -78,6 +77,9 @@ class BeamEnv:
         self.altitude_m = self.altitude_km * 1000.0
         self.n_interferers = n_interferers
         self.snr_db_clip = snr_db_clip
+        
+        # [New] LEO 衛星速度 (m/s)
+        self.SAT_VELOCITY_MAG = 7560.0
 
         # 緩存 SINR / 偽距 (m)
         self._last_sinrs_lin = np.ones(self.N_sats, dtype=np.float32)
@@ -137,6 +139,10 @@ class BeamEnv:
         # self.UT_position = np.random.uniform(-20.0, 20.0, size=2).astype(np.float32)
         self.detected_beams = self._gen_beams()
         self.undetected_beams = self._gen_beams()
+        
+        # [New] 重置時產生隨機衛星速度向量 (3D, m/s)
+        self.sat_velocities = self._gen_velocities()
+        
         self.state = self._build_state()
         return self.state
 
@@ -145,6 +151,15 @@ class BeamEnv:
         s = self.UT_position + off + np.random.uniform(-5, 5, (self.N_sats, 2)).astype(np.float32)
         e = s + np.random.uniform(-3, 3, (self.N_sats, 2)).astype(np.float32)
         return np.stack([s, e], axis=1)
+    
+    # [New] 產生隨機衛星速度 (假設衛星主要在水平面運動)
+    def _gen_velocities(self):
+        angles = np.random.uniform(0, 2*np.pi, self.N_sats)
+        # Vx, Vy, Vz (m/s)
+        vx = self.SAT_VELOCITY_MAG * np.cos(angles)
+        vy = self.SAT_VELOCITY_MAG * np.sin(angles)
+        vz = np.zeros(self.N_sats) # 簡化假設垂直速度為 0
+        return np.stack([vx, vy, vz], axis=1).astype(np.float32)
 
     def _center(self, b):
         return (b[0] + b[1]) / 2.0
@@ -177,12 +192,12 @@ class BeamEnv:
     def _err_km(self, p):
         return float(np.linalg.norm(p - self.UT_position))
 
-    # ---------- 通道特徵 (每 beam 6 維) ----------
+    # ---------- 通道特徵 (每 beam 7 維: 增加 Doppler) ----------
 
-    def _beam_channel_features(self, beam_center_xy_km):
+    def _beam_channel_features(self, beam_center_xy_km, sat_velocity_ms):
         # 給單一 beam 的通道特徵：
-        # [norm_distance, norm_az, norm_el, norm_sinr, norm_range, phase]
-        # 和 sinr_lin, pseudo_range_m (for logging)
+        # [norm_dist, norm_az, norm_el, norm_sinr, norm_range, norm_doppler, phase]
+        
         ut_xyz_km = np.array([self.UT_position[0], self.UT_position[1], 0.0], dtype=np.float32)
         sat_xyz_km = np.array([beam_center_xy_km[0], beam_center_xy_km[1], self.altitude_km], dtype=np.float32)
 
@@ -206,49 +221,69 @@ class BeamEnv:
         sinr_db = 10.0 * np.log10(max(sinr_lin, 1e-18))
 
         # ---- 特徵正規化 ----
-        # 距離 (km) -> [0,1]，假設 0~1000 km
+        # 1. 距離 (km) -> [0,1]
         d_km = d_m / 1000.0
         norm_distance = np.clip(d_km / 1000.0, 0.0, 1.0)
 
-        # az, el → [0,1]
+        # 2. Angle: az, el → [0,1]
         norm_az = (az + np.pi) / (2.0 * np.pi)
         norm_el = (el + (np.pi / 2.0)) / np.pi
 
-        # SINR dB clip → [0,1]
+        # 3. SINR dB clip → [0,1]
         min_db, max_db = self.snr_db_clip
         sinr_db_clipped = np.clip(sinr_db, min_db, max_db)
         norm_sinr = (sinr_db_clipped - min_db) / (max_db - min_db + 1e-12)
 
-        # 偽距：d_m + 雜訊
+        # 4. 偽距：d_m + 雜訊
         sigma_m = 30.0 / np.sqrt(1.0 + sinr_lin)
         pseudo_range_m = d_m + np.random.normal(0.0, sigma_m)
         norm_range = np.clip(pseudo_range_m / (self.altitude_m + 1e-12), 0.0, 1.0)
+        
+        # 5. [New] Doppler (Range Rate)
+        # 計算視線向量 (Unit Vector Sat -> UT)
+        vec_sat_ut_m = (ut_xyz_km - sat_xyz_km) * 1000.0
+        dist_m = np.linalg.norm(vec_sat_ut_m) + 1e-12
+        u_los = vec_sat_ut_m / dist_m
+        
+        # True Range Rate = dot(V_sat, u_los) (單位: m/s)
+        true_range_rate = np.dot(sat_velocity_ms, u_los)
+        
+        # 加入雜訊 N(0, 5) from Table
+        doppler_noise = np.random.normal(0, 5.0)
+        measured_doppler = true_range_rate + doppler_noise
+        
+        # 正規化: 範圍約 [-7600, 7600] -> [0, 1]
+        norm_doppler = (measured_doppler / (self.SAT_VELOCITY_MAG + 100.0) + 1.0) / 2.0
+        norm_doppler = np.clip(norm_doppler, 0.0, 1.0)
 
-        # 相位 (0~1)
+        # 6. 相位 (0~1)
         phase = (pseudo_range_m % self.lam) / self.lam
 
         feat = np.array(
-            [norm_distance, norm_az, norm_el, norm_sinr, norm_range, phase],
+            [norm_distance, norm_az, norm_el, norm_sinr, norm_range, norm_doppler, phase],
             dtype=np.float32,
         )
         return feat, sinr_lin, pseudo_range_m
 
     def _build_state(self):
-        # state: 6 features x N_sats = 60 維
+        # state: 7 features x N_sats = 70 維
         feats = []
         sinrs = []
         pranges = []
 
         for i in range(self.N_sats):
             c = self._center(self.detected_beams[i])  # km
-            f, s_lin, pr_m = self._beam_channel_features(c)
+            v = self.sat_velocities[i] # m/s
+            
+            f, s_lin, pr_m = self._beam_channel_features(c, v)
+            
             feats.append(f)
             sinrs.append(s_lin)
             pranges.append(pr_m)
 
         self._last_sinrs_lin = np.array(sinrs, dtype=np.float32)
         self._last_pseudoranges_m = np.array(pranges, dtype=np.float32)
-        feats = np.stack(feats, axis=0).reshape(-1)  # 6*N_sats
+        feats = np.stack(feats, axis=0).reshape(-1)  # 7*N_sats
         return feats.astype(np.float32)
 
 # ==============================
@@ -319,7 +354,8 @@ def train_ddqn(
     start_time = time.time()
     env = BeamEnv()
     action_dim = env.N_sats
-    state_dim = 6 * env.N_sats
+    # [Modified] 7 features per beam * 10 sats = 70 dims
+    state_dim = 7 * env.N_sats
 
     q_net = QNet(state_dim, action_dim).to(device)
     target_net = QNet(state_dim, action_dim).to(device)
@@ -439,7 +475,7 @@ def train_ddqn(
     ax2.plot(pos_ddqn[0], pos_ddqn[1], "*", color="yellow", markersize=18)
     ax2.text(0.02, 0.98, f"Distance Error: {err_ddqn_m:.2f} m",
              transform=ax2.transAxes, va="top")
-    ax2.set_title("DDQN", bbox=dict(facecolor="white", edgecolor="black", pad=5))
+    ax2.set_title("DDQN + Doppler", bbox=dict(facecolor="white", edgecolor="black", pad=5))
 
     for i in range(env.N_sats):
         c_det = env._center(env.detected_beams[i])
@@ -549,5 +585,4 @@ def train_ddqn(
     return rewards_per_episode, errors_per_episode
 
 if __name__ == "__main__":
-    # 你可以先把 total_episodes 改小一點（例如 200）測試
     train_ddqn(total_episodes=1000, rollout_steps=512, device="cpu")

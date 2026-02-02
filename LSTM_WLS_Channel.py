@@ -1,4 +1,3 @@
-
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
@@ -43,15 +42,15 @@ def upa_steering_vector(Nx, Ny, thx, thy):
 
 
 # ==============================
-# Beam environment with channel model
+# Beam environment with channel model + Doppler
 # ==============================
 
 class BeamEnv:
     """
     Beam environment (channel-based):
     - N_sats beams around a fixed UT
-    - 通道模型：UPA + FSPL + SINR + 偽距 + 相位
-    - 每個 beam 提供 pseudo-range，用來構建殘差矩陣
+    - 通道模型：UPA + FSPL + SINR + 偽距 + 相位 + [New] 都普勒
+    - 每個 beam 提供 pseudo-range 和 Doppler，用來構建殘差矩陣
     """
 
     def __init__(self,
@@ -89,27 +88,43 @@ class BeamEnv:
         self.altitude_m = altitude_km * 1000.0
         self.n_interferers = n_interferers
         self.snr_db_clip = snr_db_clip
+        
+        # [New] LEO 衛星速度 (m/s)
+        self.SAT_VELOCITY_MAG = 7560.0
 
         # Caches
         self._last_sinrs_lin = np.ones(self.N_sats, dtype=np.float32)
         self._last_pseudoranges_m = np.zeros(self.N_sats, dtype=np.float32)
+        self._last_dopplers_hz = np.zeros(self.N_sats, dtype=np.float32) # [New] Cache Doppler
 
         self.reset()
 
     # ---------- Geometry ----------
     def _generate_beam_positions(self):
         """
-        Generate random beams around UT, like DQN/PPO env.
+        Generate random beams around UT.
         """
         center_offset = np.random.uniform(-10, 10, (self.N_sats, 2))
         start_points = self.UT_position + center_offset + np.random.uniform(-5, 5, (self.N_sats, 2))
         end_points = start_points + np.random.uniform(-3, 3, (self.N_sats, 2))
         return np.stack([start_points, end_points], axis=1)  # shape: (N_sats, 2, 2)
+    
+    # [New] Generate Satellite Velocities
+    def _generate_velocities(self):
+        # 假設衛星在水平面上隨機運動 (簡化模型)
+        angles = np.random.uniform(0, 2*np.pi, self.N_sats)
+        vx = self.SAT_VELOCITY_MAG * np.cos(angles)
+        vy = self.SAT_VELOCITY_MAG * np.sin(angles)
+        vz = np.zeros(self.N_sats)
+        return np.stack([vx, vy, vz], axis=1).astype(np.float32)
 
     def reset(self):
         self.detected_beams = self._generate_beam_positions()
         self.undetected_beams = self._generate_beam_positions()
-        # 會在 _compute_state 裡更新 pseudo-ranges
+        # [New] Reset velocities
+        self.sat_velocities = self._generate_velocities()
+        
+        # 會在 _compute_state 裡更新 pseudo-ranges 和 dopplers
         _ = self._compute_state()
         return self._compute_residual_matrix()
 
@@ -151,9 +166,10 @@ class BeamEnv:
         beta = np.sqrt(self.Gt * self.Gr / L)
         return beta * a
 
-    def _beam_channel_features(self, beam_center_xy_km):
+    def _beam_channel_features(self, beam_center_xy_km, sat_velocity_ms):
         """
-        For one beam, compute 6-dim channel feature & pseudo-range.
+        For one beam, compute 7-dim channel feature:
+        [Dist, Az, El, SINR, Pseudo-range, Doppler, Phase]
         """
         ut_xyz_km = np.array([self.UT_position[0], self.UT_position[1], 0.0], dtype=np.float32)
         sat_xyz_km = np.array([beam_center_xy_km[0], beam_center_xy_km[1], self.altitude_km], dtype=np.float32)
@@ -177,64 +193,100 @@ class BeamEnv:
         sinr_lin = signal_power / (interf_powers + noise_power + 1e-18)
         sinr_db = 10.0 * np.log10(max(sinr_lin, 1e-18))
 
-        # distance normalization
+        # 1. Distance normalization
         d_km = d_m / 1000.0
         norm_distance = np.clip(d_km / 1000.0, 0.0, 1.0)
 
-        # az/el normalization
+        # 2. Az/El normalization
         norm_az = (az + np.pi) / (2.0 * np.pi)
         norm_el = (el + (np.pi / 2.0)) / np.pi
 
-        # SINR normalization
+        # 3. SINR normalization
         min_db, max_db = self.snr_db_clip
         sinr_db_clipped = np.clip(sinr_db, min_db, max_db)
         norm_sinr = (sinr_db_clipped - min_db) / (max_db - min_db + 1e-12)
 
-        # pseudo-range
+        # 4. Pseudo-range
         sigma_m = 30.0 / np.sqrt(1.0 + sinr_lin)
         pseudo_range_m = d_m + np.random.normal(0.0, sigma_m)
         norm_range = np.clip(pseudo_range_m / (self.altitude_m + 1e-12), 0.0, 1.0)
+        
+        # 5. [New] Doppler (Hz)
+        # Vector Sat -> UT
+        vec_sat_ut_m = (ut_xyz_km - sat_xyz_km) * 1000.0
+        dist_m = np.linalg.norm(vec_sat_ut_m) + 1e-12
+        u_los = vec_sat_ut_m / dist_m # unit vector
+        
+        # True Range Rate (m/s) = dot(V_sat, u_los)
+        true_rr = np.dot(sat_velocity_ms, u_los)
+        
+        # Convert to Hz: f_d = v/lambda
+        true_doppler_hz = true_rr / self.lam
+        
+        # Add Noise N(0, 5)
+        measured_doppler_hz = true_doppler_hz + np.random.normal(0, 5.0)
+        
+        # Normalize [-Max, Max] -> [0, 1]
+        max_doppler = (self.SAT_VELOCITY_MAG + 100.0) / self.lam
+        norm_doppler = (measured_doppler_hz / max_doppler + 1.0) / 2.0
+        norm_doppler = np.clip(norm_doppler, 0.0, 1.0)
 
-        # phase
+        # 6. Phase
         phase = (pseudo_range_m % self.lam) / self.lam
 
         feat = np.array(
-            [norm_distance, norm_az, norm_el, norm_sinr, norm_range, phase],
+            [norm_distance, norm_az, norm_el, norm_sinr, norm_range, norm_doppler, phase],
             dtype=np.float32,
         )
-        return feat, sinr_lin, pseudo_range_m
+        return feat, sinr_lin, pseudo_range_m, measured_doppler_hz
 
     def _compute_state(self):
         """
-        Compute per-beam channel features (但這裡我們主要是要 pseudo-range).
+        Compute per-beam features and cache PR and Doppler for residual matrix.
         """
         feats = []
         sinrs = []
         pranges = []
+        dopplers = []
+        
         for i in range(self.N_sats):
             c = self._beam_center(self.detected_beams[i])
-            f, s_lin, pr_m = self._beam_channel_features(c)
+            v = self.sat_velocities[i]
+            
+            f, s_lin, pr_m, dop_hz = self._beam_channel_features(c, v)
+            
             feats.extend(f.tolist())
             sinrs.append(s_lin)
             pranges.append(pr_m)
+            dopplers.append(dop_hz)
+            
         self._last_sinrs_lin = np.array(sinrs, dtype=np.float32)
         self._last_pseudoranges_m = np.array(pranges, dtype=np.float32)
+        self._last_dopplers_hz = np.array(dopplers, dtype=np.float32) # [New]
         return np.array(feats, dtype=np.float32)
 
     def _compute_residual_matrix(self):
         """
-        模仿論文的「殘差矩陣」概念，但較簡化：
-        - 先拿到每顆 beam 的 pseudo-range r_i
-        - 定義 centered residual: e_i = r_i - mean(r)
-        - 構造 NxN 矩陣 M：M[i,j] = |e_i - e_j|
-        - 再做 normalize 到 [0,1]
+        構建融合殘差矩陣 (Fused Residual Matrix):
+        M[i,j] = 0.5 * |Delta_PR[i,j]| + 0.5 * |Delta_Doppler[i,j]| (Normalized)
+        這樣 LSTM 就能同時學到偽距與都普勒的幾何特徵。
         """
-        r = self._last_pseudoranges_m  # shape (N_sats,)
-        e = r - np.mean(r)
-        M = np.abs(e[:, None] - e[None, :])  # pairwise residual difference
-        max_val = np.max(M) + 1e-12
-        M_norm = M / max_val
-        return M_norm.astype(np.float32)  # (N_sats, N_sats)
+        # 1. Pseudo-range residuals
+        r = self._last_pseudoranges_m
+        e_r = r - np.mean(r)
+        M_r = np.abs(e_r[:, None] - e_r[None, :])
+        M_r = M_r / (np.max(M_r) + 1e-12) # Normalize to 0-1
+        
+        # 2. [New] Doppler residuals
+        d = self._last_dopplers_hz
+        e_d = d - np.mean(d)
+        M_d = np.abs(e_d[:, None] - e_d[None, :])
+        M_d = M_d / (np.max(M_d) + 1e-12) # Normalize to 0-1
+        
+        # 3. Fuse (簡單平均，保持 shape 為 NxN)
+        M_final = 0.5 * M_r + 0.5 * M_d
+        
+        return M_final.astype(np.float32)
 
     # ---------- Weighted CoG & error ----------
     def weighted_position(self, weights):
@@ -290,19 +342,19 @@ class BeamEnv:
 def generate_lstm_residual_dataset(num_samples=2000, N_sats=10):
     """
     產生 LSTM 訓練資料：
-    - X: (num_samples, N_sats, N_sats) 殘差矩陣 (channel-based pseudo-range residual)
-    - y: (num_samples, N_sats) 目標權重（用幾何距離設計的“理想加權”）
+    - X: (num_samples, N_sats, N_sats) 融合殘差矩陣 (Range + Doppler)
+    - y: (num_samples, N_sats) 目標權重
     """
     env = BeamEnv(N_sats=N_sats)
     X_list = []
     y_list = []
 
     for _ in range(num_samples):
-        # 新的幾何 + 通道
+        # 新的幾何 + 通道 + 都普勒
         env.reset()
         M = env._compute_residual_matrix()  # (N_sats, N_sats)
 
-        # 理想權重：距離越近權重越大 → w_i ∝ exp(-distance_i / tau)
+        # 理想權重：距離越近權重越大
         centers = np.array([env._beam_center(env.detected_beams[i]) for i in range(N_sats)], dtype=np.float32)
         dists_km = np.linalg.norm(centers - env.UT_position[None, :], axis=1)  # km
         tau = 10.0  # km scale
@@ -323,8 +375,9 @@ def generate_lstm_residual_dataset(num_samples=2000, N_sats=10):
 
 def build_lstm_residual_model(input_shape=(10, 10), output_dim=10):
     """
-    LSTM 輸入：每一個 time step 是殘差矩陣的一列（長度 N_sats），
-    序列長度 = N_sats。也就是 input_shape=(N_sats, N_sats)。
+    LSTM 輸入：序列長度 = N_sats，Feature 維度 = N_sats。
+    因為我們將 Range Residual 和 Doppler Residual 融合在同一個矩陣 M，
+    形狀保持 (N, N)，所以模型結構不需要改變。
     """
     model = Sequential()
     model.add(LSTM(64, input_shape=input_shape, return_sequences=False))
@@ -346,17 +399,17 @@ def train_lstm_channel_residual(num_samples=2000,
                                 N_sats=10,
                                 epochs=30,
                                 batch_size=32):
-    print("Generating residual-based channel dataset ...")
+    print("Generating residual-based (Range+Doppler) dataset ...")
     X, y = generate_lstm_residual_dataset(num_samples=num_samples, N_sats=N_sats)
     # train/val split
     split = int(0.8 * num_samples)
     X_train, X_val = X[:split], X[split:]
     y_train, y_val = y[:split], y[split:]
 
-    print("Building LSTM model (residual-based, channel-aware) ...")
+    print("Building LSTM model (residual-based, channel-aware + doppler) ...")
     model = build_lstm_residual_model(input_shape=(N_sats, N_sats), output_dim=N_sats)
 
-    print("Start training LSTM on residual matrices (state ~ N×N) ...")
+    print("Start training LSTM on residual matrices ...")
     hist = model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
@@ -366,24 +419,23 @@ def train_lstm_channel_residual(num_samples=2000,
         verbose=1
     )
 
-    # 紀錄訓練時間
     elapsed = time.time() - start_time
     print(f"Training finished, elapsed time: {elapsed:.2f} s")
 
-    # 用驗證集做定位誤差統計（重新抽樣新的幾何）
+    # 用驗證集做定位誤差統計
     env = BeamEnv(N_sats=N_sats)
     num_test = min(200, X_val.shape[0])
     errors_m = []
 
     for _ in range(num_test):
         _ = env.reset()
-        M = env._compute_residual_matrix()[None, ...]  # shape (1, N_sats, N_sats)
-        pred_w = model.predict(M, verbose=0)[0]  # (N_sats,)
+        M = env._compute_residual_matrix()[None, ...]
+        pred_w = model.predict(M, verbose=0)[0]
         err_m = env.error_m(pred_w)
         errors_m.append(err_m)
 
     errors_m = np.array(errors_m)
-    print(f"[LSTM Residual + Channel] 平均定位誤差: {np.mean(errors_m):.2f} m,  標準差: {np.std(errors_m):.2f} m")
+    print(f"[LSTM Residual + Doppler] 平均定位誤差: {np.mean(errors_m):.2f} m,  標準差: {np.std(errors_m):.2f} m")
 
     # 畫訓練曲線 (Loss)
     plt.figure(figsize=(12, 5))
@@ -392,7 +444,7 @@ def train_lstm_channel_residual(num_samples=2000,
     plt.plot(hist.history["val_loss"], label="Val Loss")
     plt.xlabel("Epoch")
     plt.ylabel("MSE Loss")
-    plt.title("LSTM Training Loss (Residual-Channel)")
+    plt.title("LSTM Training Loss (Range+Doppler)")
     plt.grid(True, linestyle="--", alpha=0.7)
     plt.legend()
 
@@ -400,22 +452,21 @@ def train_lstm_channel_residual(num_samples=2000,
     plt.hist(errors_m, bins=20, alpha=0.8)
     plt.xlabel("Error (m)")
     plt.ylabel("Count")
-    plt.title("LSTM Residual-Channel Localization Error (m)")
+    plt.title("LSTM Residual Localization Error (m)")
     plt.grid(True, linestyle="--", alpha=0.7)
 
     plt.tight_layout()
     plt.show()
 
-    # 挑一個案例畫 2D beam 圖 + UT + estimated position
+    # 挑一個案例畫 2D beam 圖
     env = BeamEnv(N_sats=N_sats)
     _ = env.reset()
     M_case = env._compute_residual_matrix()[None, ...]
     pred_w_case = model.predict(M_case, verbose=0)[0]
     env.visualize_case(weights=pred_w_case,
-                       title="LSTM Residual-Channel Beam Positioning (Single Case)")
+                       title="LSTM Residual-Channel+Doppler Positioning")
 
-    # 存成 npz 給之後跟 DQN/PPO 比較用
-    np.savez("lstm_channel_residual_logs.npz",
+    np.savez("lstm_channel_residual_doppler_logs.npz",
              train_loss=np.array(hist.history["loss"], dtype=np.float32),
              val_loss=np.array(hist.history["val_loss"], dtype=np.float32),
              errors_m=errors_m)
